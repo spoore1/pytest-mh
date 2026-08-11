@@ -16,11 +16,15 @@ from .multihost import (
     MultihostConfig,
     MultihostDomain,
     MultihostHost,
+    MultihostReentrantUtility,
     MultihostRole,
+    MultihostUtility,
     mh_utility_enter_dependencies,
     mh_utility_exit_dependencies,
     mh_utility_pytest_report_teststatus,
+    mh_utility_setup,
     mh_utility_setup_dependencies,
+    mh_utility_teardown,
     mh_utility_teardown_dependencies,
 )
 from .topology import Topology, TopologyDomain
@@ -267,12 +271,36 @@ class MultihostFixture(object):
         """
         Run per-test setup of each host.
         """
-        for item in self.hosts:
+        all_topology_hosts = set(self.topology_controller.hosts)
+        fixture_hosts = set(self.hosts)
+        background_hosts = sorted(all_topology_hosts - fixture_hosts, key=lambda x: x.hostname)
+
+        for item in list(self.hosts) + background_hosts:
             item._op_state.clear("setup")
+            for attr_val in vars(item).values():
+                if isinstance(attr_val, MultihostUtility) and not isinstance(attr_val, MultihostReentrantUtility):
+                    attr_val._op_state.clear("setup")
 
         for item in self.hosts:
             item.setup()
             item._op_state.set_success("setup")
+            # Call setup() for any plain MultihostUtility on the host not already
+            # initialized by host.setup() — ensures utilities like JournaldUtils
+            # get a test-start timestamp on all hosts, including background ones.
+            for attr_val in vars(item).values():
+                if (
+                    isinstance(attr_val, MultihostUtility)
+                    and not isinstance(attr_val, MultihostReentrantUtility)
+                    and not attr_val._op_state.check_success("setup")
+                ):
+                    mh_utility_setup(attr_val)
+
+        # Also initialize utilities on topology hosts that are not active fixture
+        # hosts (e.g., a shared infrastructure host not exposed as a test role).
+        for item in background_hosts:
+            for attr_val in vars(item).values():
+                if isinstance(attr_val, MultihostUtility) and not isinstance(attr_val, MultihostReentrantUtility):
+                    mh_utility_setup(attr_val)
 
     def _setup_topology(self) -> None:
         """
@@ -329,6 +357,10 @@ class MultihostFixture(object):
         """
         Run per-test teardown of each host.
         """
+        all_topology_hosts = set(self.topology_controller.hosts)
+        fixture_hosts = set(self.hosts)
+        background_hosts = sorted(all_topology_hosts - fixture_hosts, key=lambda x: x.hostname)
+
         errors = []
         for item in self.hosts:
             if item._op_state.check_success("setup"):
@@ -336,6 +368,21 @@ class MultihostFixture(object):
                     item.teardown()
                 except Exception as e:
                     errors.append(e)
+
+                for attr_val in vars(item).values():
+                    if isinstance(attr_val, MultihostUtility) and not isinstance(attr_val, MultihostReentrantUtility):
+                        try:
+                            mh_utility_teardown(attr_val)
+                        except Exception as e:
+                            errors.append(e)
+
+        for item in background_hosts:
+            for attr_val in vars(item).values():
+                if isinstance(attr_val, MultihostUtility) and not isinstance(attr_val, MultihostReentrantUtility):
+                    try:
+                        mh_utility_teardown(attr_val)
+                    except Exception as e:
+                        errors.append(e)
 
         if errors:
             raise TeardownExceptionGroup("Unable to teardown some hosts (host.teardown)", errors)
