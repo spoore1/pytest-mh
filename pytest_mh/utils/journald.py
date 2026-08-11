@@ -51,6 +51,14 @@ class JournaldUtils(MultihostUtility[MultihostHost]):
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
+        if not self._test_start:
+            # setup() was not called for this host — initialize now to avoid running
+            # journalctl without a timestamp filter, which dumps the entire journal.
+            # This produces a near-empty log for this test but prevents an SSH channel
+            # timeout that cascades into sshd resource exhaustion on longer runs.
+            self._test_start = self.now
+            self._cursor = self._test_start
+
         self.host.conn.run(f"journalctl --since '{self._test_start}' > /var/log/journald.log")
         return {"/var/log/journald.log"}
 
