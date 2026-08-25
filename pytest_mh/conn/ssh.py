@@ -545,7 +545,7 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
                 host_key_checking=False,
                 open_session_retries=10,
             )
-            self.__conn.set_ssh_options("timeout", 1)
+            self.__conn.set_ssh_options("timeout", 15)
             self.__conn.set_log_level(ANSIBLE_PYLIBSSH_NOLOG)
         except LibsshSessionException as e:
             raise SSHAuthenticationError(self.host, self.port, self.user, e.message)
