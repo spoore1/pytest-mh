@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import signal
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator, Self
 
 import colorama as c
 from pylibsshext.channel import Channel as LibsshChannel
-from pylibsshext.errors import LibsshSessionException
+from pylibsshext.errors import LibsshChannelException, LibsshSessionException
 from pylibsshext.logging import ANSIBLE_PYLIBSSH_NOLOG
 from pylibsshext.session import Session as LibsshSession
 
@@ -260,6 +261,7 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
             },
         )
 
+        self.__client: SSHClient = client
         self.__conn: LibsshSession = conn
         self.__unified_newlines: bool = unified_newlines
         self.__channel: LibsshChannel | None = None
@@ -300,18 +302,39 @@ class SSHProcess(Process[SSHProcessResult, SSHInputBuffer, SSHProcessTimeoutErro
         This is an internal method called by :meth:`run` after executing
         generic code.
         """
-        self.__channel = self.__conn.new_channel()
-        try:
-            self.__channel.request_exec(self.full_command_line)
-            self.__stdout = SSHOutputBuffer(self.__channel, stderr=False)
-            self.__stderr = SSHOutputBuffer(self.__channel, stderr=True)
-            self.__stdin = SSHInputBuffer(self.__channel)
+        max_retries = 2  # Allow up to 3 total attempts (0, 1, 2)
+        base_delay = 2   # Base delay in seconds for exponential backoff
 
-            if self.input is not None:
-                self.stdin.write(self.input)
-        except Exception:
-            self._close()
-            raise
+        for attempt in range(max_retries + 1):
+            try:
+                self.__channel = self.__conn.new_channel()
+                self.__channel.request_exec(self.full_command_line)
+                self.__stdout = SSHOutputBuffer(self.__channel, stderr=False)
+                self.__stderr = SSHOutputBuffer(self.__channel, stderr=True)
+                self.__stdin = SSHInputBuffer(self.__channel)
+
+                if self.input is not None:
+                    self.stdin.write(self.input)
+                break  # Success, exit retry loop
+            except LibsshChannelException as e:
+                self._close()
+                # If this is a "Failed to open_session" error and we have retries left,
+                # try to reconnect and retry with exponential backoff
+                if "Failed to open_session" in str(e) and attempt < max_retries:
+                    # Calculate exponential backoff: 2s, 4s, 8s, etc.
+                    delay = base_delay * (2 ** attempt)
+                    self.logger.warning(
+                        f"SSH channel creation failed (attempt {attempt + 1}/{max_retries + 1}), "
+                        f"reconnecting after {delay}s delay..."
+                    )
+                    time.sleep(delay)
+                    self.__client.reconnect()
+                    self.__conn = self.__client.session  # Update connection reference
+                    continue
+                raise
+            except Exception:
+                self._close()
+                raise
 
     def _wait(self) -> SSHProcessResult:
         """
@@ -519,6 +542,16 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
     def connected(self) -> bool:
         return bool(self.__conn.is_connected)
 
+    @property
+    def session(self) -> LibsshSession:
+        """
+        Get the underlying libssh session.
+
+        :return: The libssh session object.
+        :rtype: LibsshSession
+        """
+        return self.__conn
+
     def connect(self) -> None:
         """
         Connect to the host.
@@ -544,6 +577,7 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
                 port=self.port,
                 host_key_checking=False,
                 open_session_retries=10,
+                timeout=30,  # TCP connection timeout: 30 seconds (increased from default ~10s)
             )
             self.__conn.set_ssh_options("timeout", 15)
             self.__conn.set_log_level(ANSIBLE_PYLIBSSH_NOLOG)
@@ -557,6 +591,40 @@ class SSHClient(Connection[SSHProcess, SSHProcessResult]):
         )
 
         self.__conn.disconnect()
+
+    def reconnect(self) -> None:
+        """
+        Reconnect to the host by closing and reopening the SSH connection.
+
+        This can be used to refresh stale connections or recover from
+        connection issues in long-running sessions.
+        """
+        if self.connected:
+            self.disconnect()
+        self.connect()
+
+    def check_connection_health(self) -> bool:
+        """
+        Check if the SSH connection is healthy by attempting to create a test channel.
+
+        This can be used before critical operations to detect stale connections
+        before they cause failures.
+
+        :return: True if connection is healthy, False otherwise.
+        :rtype: bool
+        """
+        if not self.connected:
+            return False
+
+        try:
+            # Try to create and immediately close a test channel
+            test_channel = self.session.new_channel()
+            test_channel.close()
+            return True
+        except LibsshChannelException:
+            return False
+        except Exception:
+            return False
 
     def create_process(
         self,
